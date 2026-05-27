@@ -8,9 +8,22 @@ from geopy.extra.rate_limiter import RateLimiter
 st.set_page_config(page_title="Route Planner", layout="centered")
 st.title("Route Planner - Address Mapper")
 
-# Session state
 if "locations" not in st.session_state:
     st.session_state.locations = []
+
+# ===================== CACHED GEOCODING =====================
+@st.cache_data(show_spinner=False, ttl=3600)  # Cache results for 1 hour
+def geocode_address(address: str):
+    """Geocode a single address. Results are cached to reduce API calls and avoid rate limits."""
+    try:
+        geolocator = Nominatim(user_agent="csv-mapper-v4-streamlit", timeout=8)
+        result = geolocator.geocode(address)
+        if result:
+            return {"lat": result.latitude, "lon": result.longitude}
+        return None
+    except Exception:
+        return None
+
 
 # ===================== TABS =====================
 tab1, tab2 = st.tabs(["📁 Upload CSV / Excel", "✍️ Enter Addresses Manually"])
@@ -20,8 +33,8 @@ with tab1:
     st.markdown("""
     ### Recommended CSV / Excel Format (works worldwide)
 
-    **Best option:** One column containing the **full address**  
-    (This works best for addresses outside the United States)
+    **Best option:** One column called **Full Address** containing the complete address.  
+    This works best internationally.
 
     **Also supported:** Separate columns for Address + City + State/Province + Postal Code  
     (The app will automatically combine them)
@@ -35,13 +48,11 @@ with tab1:
     Red Rocks Amphitheatre,18300 W Alameda Pkwy, Morrison, CO 80465, USA
     ```
 
-    The more complete the address you provide, the better the results will be.
+    **Note:** The free geocoding service (Nominatim) can be slow or temporarily unavailable on Streamlit Cloud. 
+    If it fails, try again in a minute or use fewer addresses.
     """)
 
-    uploaded_file = st.file_uploader(
-        "Upload your CSV or Excel file", 
-        type=["csv", "xlsx"]
-    )
+    uploaded_file = st.file_uploader("Upload your CSV or Excel file", type=["csv", "xlsx"])
 
     if uploaded_file is not None:
         if uploaded_file.name.endswith('.csv'):
@@ -49,47 +60,35 @@ with tab1:
         else:
             df = pd.read_excel(uploaded_file)
 
-        st.write("**Preview of your uploaded file:**")
-        st.dataframe(df.head(8))
+        total_rows = len(df)
+        st.write(f"**Preview of your uploaded file** — {total_rows} addresses found")
 
-        # === Smart column detection ===
+        # Show full dataframe with scrolling (much better UX than head(8))
+        st.dataframe(df, use_container_width=True, height=320)
+
+        # Smart column detection
         cols_lower = {c.lower().strip(): c for c in df.columns}
 
-        name_col = None
-        address_col = None
-        city_col = None
-        state_col = None
-        zip_col = None
-        country_col = None
+        name_col = next((orig for key, orig in cols_lower.items() 
+                        if any(x in key for x in ['name', 'stop', 'customer', 'client'])), None)
+        address_col = next((orig for key, orig in cols_lower.items() 
+                           if any(x in key for x in ['address', 'street', 'full address', 'location'])), None)
+        city_col = next((orig for key, orig in cols_lower.items() if 'city' in key), None)
+        state_col = next((orig for key, orig in cols_lower.items() 
+                          if any(x in key for x in ['state', 'province'])), None)
+        zip_col = next((orig for key, orig in cols_lower.items() 
+                        if any(x in key for x in ['zip', 'postal', 'cep', 'postcode'])), None)
+        country_col = next((orig for key, orig in cols_lower.items() if 'country' in key), None)
 
-        for key, original in cols_lower.items():
-            if not name_col and any(x in key for x in ['name', 'location name', 'stop', 'customer', 'client']):
-                name_col = original
-            if not address_col and any(x in key for x in ['address', 'street', 'full address', 'location']):
-                address_col = original
-            if not city_col and 'city' in key:
-                city_col = original
-            if not state_col and any(x in key for x in ['state', 'province', 'st']):
-                state_col = original
-            if not zip_col and any(x in key for x in ['zip', 'postal', 'cep', 'postcode']):
-                zip_col = original
-            if not country_col and any(x in key for x in ['country', 'nation']):
-                country_col = original
-
-        # If we have separate Address + City + State, combine them automatically
+        # Auto-combine separate address columns into one
         if address_col and (city_col or state_col):
             def build_full_address(row):
                 parts = []
-                if address_col and pd.notna(row.get(address_col)):
-                    parts.append(str(row[address_col]).strip())
-                if city_col and pd.notna(row.get(city_col)):
-                    parts.append(str(row[city_col]).strip())
-                if state_col and pd.notna(row.get(state_col)):
-                    parts.append(str(row[state_col]).strip())
-                if zip_col and pd.notna(row.get(zip_col)):
-                    parts.append(str(row[zip_col]).strip())
-                if country_col and pd.notna(row.get(country_col)):
-                    parts.append(str(row[country_col]).strip())
+                for col in [address_col, city_col, state_col, zip_col, country_col]:
+                    if col and pd.notna(row.get(col)):
+                        val = str(row[col]).replace('.0', '').strip()  # Fix float zip issue
+                        if val:
+                            parts.append(val)
                 return ", ".join(parts)
 
             df['Full Address'] = df.apply(build_full_address, axis=1)
@@ -97,134 +96,80 @@ with tab1:
             st.info("Detected separate address columns → automatically combined them into a full address.")
 
         if address_col is None:
-            st.warning("Couldn't automatically detect an address column.")
             address_col = st.selectbox("Which column contains the addresses?", df.columns)
 
         if st.button("Plot Addresses on Map", key="upload_btn"):
-            with st.spinner("Geocoding addresses... (this can take 10–30 seconds)"):
-                geolocator = Nominatim(user_agent="route_planner_v7")
-                geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1)
-
+            with st.spinner("Geocoding addresses... (this can take 15–60 seconds)"):
                 new_locations = []
+                failed = []
 
                 for idx, row in df.iterrows():
-                    # Get name if available
-                    name_val = ""
-                    if name_col and pd.notna(row.get(name_col)):
-                        name_val = str(row[name_col]).strip()
-
-                    # Get address
-                    addr_val = ""
-                    if address_col and pd.notna(row.get(address_col)):
-                        addr_val = str(row[address_col]).strip()
+                    name_val = str(row[name_col]).strip() if name_col and pd.notna(row.get(name_col)) else ""
+                    addr_val = str(row[address_col]).replace('.0', '').strip() if address_col and pd.notna(row.get(address_col)) else ""
 
                     if not addr_val:
                         continue
 
-                    try:
-                        result = geocode(addr_val)
-                        if result:
-                            new_locations.append({
-                                "name": name_val,
-                                "address": addr_val,
-                                "lat": result.latitude,
-                                "lon": result.longitude
-                            })
-                    except Exception as e:
-                        st.warning(f"Could not geocode: {addr_val}")
+                    result = geocode_address(addr_val)
+
+                    if result:
+                        new_locations.append({
+                            "name": name_val,
+                            "address": addr_val,
+                            "lat": result["lat"],
+                            "lon": result["lon"]
+                        })
+                    else:
+                        failed.append(addr_val)
 
                 st.session_state.locations = new_locations
-                st.success(f"Successfully plotted {len(new_locations)} addresses!")
+
+                if new_locations:
+                    st.success(f"Successfully plotted {len(new_locations)} addresses!")
+                else:
+                    st.error("No addresses could be geocoded. The free service is currently overloaded or blocking requests from Streamlit Cloud. Try again in a minute.")
+
+                if failed:
+                    st.warning(f"Failed to geocode {len(failed)} addresses. Try again later or reduce the number of addresses.")
 
 # ===================== TAB 2: Manual Entry =====================
 with tab2:
-    st.markdown("""
-    **Enter addresses manually**
+    st.write("Add addresses one by one:")
 
-    For best international support, enter the **complete address** in one line.
-    The **Name** field is optional but recommended — it will show when hovering over the point on the map.
-    """)
-
-    # === Primary: Full Address input (recommended for international use) ===
-    full_address_input = st.text_input(
-        "Full Address",
-        placeholder="1701 Wynkoop St, Denver, CO 80202, USA",
-        help="Enter the complete address. This works best worldwide."
-    )
-
-    man_name = st.text_input("Name / Label (optional)", placeholder="e.g. Union Station")
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        manual_address = st.text_input("Full Address", placeholder="1701 Wynkoop St, Denver, CO 80202, USA")
+    with col2:
+        manual_name = st.text_input("Name / Label (optional)")
 
     if st.button("Add Address", key="manual_add"):
-        if full_address_input.strip():
+        if manual_address.strip():
             st.session_state.locations.append({
-                "name": man_name.strip(),
-                "address": full_address_input.strip(),
+                "name": manual_name.strip(),
+                "address": manual_address.strip(),
                 "lat": None,
                 "lon": None
             })
-            display_text = f"{man_name} — {full_address_input}" if man_name else full_address_input
-            st.success(f"Added: {display_text}")
+            st.success(f"Added: {manual_address}")
         else:
-            st.warning("Please enter a full address.")
+            st.warning("Please enter an address.")
 
-    # Optional: Advanced broken-out fields (collapsed)
-    with st.expander("Advanced: Enter by separate fields (US-style)"):
-        col1, col2 = st.columns(2)
-        with col1:
-            adv_name = st.text_input("Name (optional)", key="adv_name")
-            adv_street = st.text_input("Street Address", key="adv_street")
-        with col2:
-            adv_city = st.text_input("City", key="adv_city")
-            adv_state = st.text_input("State / Province", key="adv_state")
-            adv_zip = st.text_input("Postal Code", key="adv_zip")
-
-        if st.button("Add using separate fields", key="adv_add"):
-            if adv_street and adv_city:
-                parts = [adv_street.strip(), adv_city.strip()]
-                if adv_state:
-                    parts.append(adv_state.strip())
-                if adv_zip:
-                    parts.append(adv_zip.strip())
-                full = ", ".join(parts)
-
-                st.session_state.locations.append({
-                    "name": adv_name.strip(),
-                    "address": full,
-                    "lat": None,
-                    "lon": None
-                })
-                display_text = f"{adv_name} — {full}" if adv_name else full
-                st.success(f"Added: {display_text}")
-            else:
-                st.warning("Street and City are required when using separate fields.")
-
-    # Show current list
     if st.session_state.locations:
-        st.write("**Addresses added so far:**")
+        st.write("**Current addresses in list:**")
         for i, loc in enumerate(st.session_state.locations, 1):
-            name_part = loc.get("name", "")
-            addr_part = loc.get("address", "")
-            if name_part:
-                st.write(f"{i}. **{name_part}** — {addr_part}")
-            else:
-                st.write(f"{i}. {addr_part}")
+            display = f"{loc['name']} — {loc['address']}" if loc['name'] else loc['address']
+            st.write(f"{i}. {display}")
 
     if st.button("Plot All on Map", key="manual_plot_btn"):
         with st.spinner("Geocoding addresses..."):
-            geolocator = Nominatim(user_agent="route_planner_v7")
-            geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.1)
-
             for loc in st.session_state.locations:
                 if loc["lat"] is None:
-                    try:
-                        res = geocode(loc["address"])
-                        if res:
-                            loc["lat"] = res.latitude
-                            loc["lon"] = res.longitude
-                    except:
-                        pass
+                    result = geocode_address(loc["address"])
+                    if result:
+                        loc["lat"] = result["lat"]
+                        loc["lon"] = result["lon"]
 
-            st.session_state.locations = [loc for loc in st.session_state.locations if loc["lat"]]
+            st.session_state.locations = [loc for loc in st.session_state.locations if loc["lat"] is not None]
             st.success("Map updated!")
 
 # ===================== MAP DISPLAY =====================
@@ -232,23 +177,14 @@ if st.session_state.locations:
     st.divider()
     st.subheader("Map View")
 
-    valid = [loc for loc in st.session_state.locations if loc.get("lat")]
+    valid = [loc for loc in st.session_state.locations if loc["lat"]]
 
     if valid:
         first = valid[0]
         m = folium.Map(location=[first["lat"], first["lon"]], zoom_start=11)
 
         for loc in valid:
-            name = loc.get("name", "").strip()
-            address = loc.get("address", "")
-
-            if name:
-                tooltip_text = f"{name} — {address}"
-                popup_html = f"<b>{name}</b><br>{address}"
-            else:
-                tooltip_text = address
-                popup_html = address
-
+            label = f"{loc['name']} — {loc['address']}" if loc['name'] else loc['address']
             folium.CircleMarker(
                 location=[loc["lat"], loc["lon"]],
                 radius=7,
@@ -256,8 +192,8 @@ if st.session_state.locations:
                 fill=True,
                 fill_color="#2E86AB",
                 fill_opacity=0.85,
-                popup=popup_html,
-                tooltip=tooltip_text
+                popup=label,
+                tooltip=label
             ).add_to(m)
 
         st_folium(m, width=900, height=550)
